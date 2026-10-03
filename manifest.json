@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Job Match Helper",
+  "version": "1.0.0",
+  "description": "Compares your resume with the job page you are viewing and suggests resume changes.",
+  "permissions": ["storage", "scripting", "activeTab", "sidePanel"],
+  "host_permissions": ["<all_urls>", "https://api.groq.com/*"],
+  "side_panel": { "default_path": "sidepanel.html" },
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Open Job Match Helper" }
+}
