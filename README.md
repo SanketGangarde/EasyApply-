@@ -1,4 +1,4 @@
-# Job Match Helper
+# Easy Apply
 
 Chrome extension that compares your resume with the job page you have open.
 
