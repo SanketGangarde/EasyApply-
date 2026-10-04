@@ -17,8 +17,11 @@
     <label for="apiKey">Groq API key</label>
     <input id="apiKey" type="password" placeholder="gsk_..." autocomplete="off" />
     <p class="hint">Free key from console.groq.com/keys. It is stored only in this browser.</p>
-    <label for="model">Model</label>
+    <label for="model">Model (analysis, chat, resume edits)</label>
     <input id="model" type="text" value="openai/gpt-oss-120b" />
+    <label for="searchModel">Model for company web check</label>
+    <input id="searchModel" type="text" value="openai/gpt-oss-20b" />
+    <p class="hint">Must support browser search: openai/gpt-oss-20b or openai/gpt-oss-120b. (groq/compound was retired by Groq on Sept 21, 2026.)</p>
     <button id="saveSettings" class="secondary">Save settings</button>
     <span id="settingsMsg" class="hint"></span>
   </details>
@@ -32,6 +35,15 @@
       <textarea id="resumeText" rows="6" placeholder="Paste your resume text here"></textarea>
       <button id="saveResumeText" class="secondary">Save pasted text</button>
     </details>
+    <details>
+      <summary>Overleaf / LaTeX resume (optional, for tailoring)</summary>
+      <div id="latexStatus" class="hint">No LaTeX resume saved.</div>
+      <textarea id="latexText" class="code" rows="6" placeholder="Paste your full .tex code from Overleaf here"></textarea>
+      <div class="btn-row">
+        <button id="saveLatex" class="secondary">Save LaTeX</button>
+        <button id="clearLatex" class="secondary">Remove</button>
+      </div>
+    </details>
   </section>
 
   <section class="box">
@@ -42,17 +54,20 @@
   </section>
 
   <section id="results" hidden></section>
+  <section id="companyBox" class="box" hidden></section>
+  <section id="tailorBox" class="box" hidden></section>
 
   <section id="chatBox" class="box" hidden>
     <h2>Ask a follow-up</h2>
     <div id="chatLog"></div>
     <div class="chat-input">
-      <input id="chatInput" type="text" placeholder="e.g. Rewrite my summary for this role" />
+      <input id="chatInput" type="text" placeholder="e.g. Which resume sections should I change first?" />
       <button id="chatSend" class="secondary">Send</button>
     </div>
   </section>
 
   <script src="lib/pdf.min.js"></script>
+  <script src="utils.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 </html>

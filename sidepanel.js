@@ -1,8 +1,12 @@
 const $ = (id) => document.getElementById(id);
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const MAX_RESUME_CHARS = 6000; // keeps requests inside Groq free-tier token limits
+const DEFAULT_MODEL = "openai/gpt-oss-120b";
+const DEFAULT_SEARCH_MODEL = "openai/gpt-oss-20b";   // groq/compound was retired on 2026-09-21
+const MAX_RESUME_CHARS = 6000;   // keeps requests inside Groq free-tier token limits
 const MAX_PAGE_CHARS = 10000;
 const MAX_CHAT_JD_CHARS = 5000;
+const MAX_LATEX_CHARS = 12000;
+const CACHE_DAYS = 7;
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = "lib/pdf.worker.min.js";
 
@@ -14,18 +18,23 @@ CONTENT RULES:
 - Do not make up score calculations or point tables.
 - Keep answers under 250 words unless asked for more.`;
 
+let runId = 0;          // increases on every Analyze click, so old async results are ignored
+let current = null;     // { analysis, page } of the latest analysis
 let chatHistory = [];
 let chatContext = "";
+let edits = [];         // LaTeX edits suggested by the model
+let latexTruncated = false;
 
 /* ---------- small helpers ---------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function el(tag, cls, text) {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
   if (text !== undefined) n.textContent = text;
   return n;
 }
-function setStatus(msg, isError = false) {
-  const s = $("status");
+function setStatus(msg, isError = false, id = "status") {
+  const s = $(id);
   s.textContent = msg;
   s.className = "status" + (isError ? " error" : "");
 }
@@ -33,19 +42,12 @@ const clamp = (n) => Math.max(0, Math.min(100, Math.round(Number(n) || 0)));
 
 /* ---------- clean text rendering (no raw markdown shown) ---------- */
 function plain(t) {
-  return String(t == null ? "" : t)
-    .replace(/\*\*/g, "")
-    .replace(/`/g, "")
-    .replace(/^#+\s*/, "");
+  return String(t == null ? "" : t).replace(/\*\*/g, "").replace(/`/g, "").replace(/^#+\s*/, "");
 }
 function addInline(parent, text) {
   text.split(/(\*\*[^*]+\*\*)/g).forEach((p) => {
-    if (/^\*\*[^*]+\*\*$/.test(p))
-      parent.appendChild(el("strong", "", p.slice(2, -2)));
-    else if (p)
-      parent.appendChild(
-        document.createTextNode(p.replace(/\*+/g, "").replace(/`/g, "")),
-      );
+    if (/^\*\*[^*]+\*\*$/.test(p)) parent.appendChild(el("strong", "", p.slice(2, -2)));
+    else if (p) parent.appendChild(document.createTextNode(p.replace(/\*+/g, "").replace(/`/g, "")));
   });
 }
 function renderRich(container, raw) {
@@ -53,64 +55,57 @@ function renderRich(container, raw) {
   let list = null;
   raw.split("\n").forEach((line) => {
     let t = line.trim();
-    if (!t || /^[-|:\s]+$/.test(t)) {
-      list = null;
-      return;
-    } // blanks, rules, table separators
-    if (t.startsWith("|")) {
-      // table row -> one line
-      t = t
-        .split("|")
-        .map((c) => c.trim())
-        .filter(Boolean)
-        .join(" - ");
-    }
+    if (!t || /^[-|:\s]+$/.test(t)) { list = null; return; }
+    if (t.startsWith("|")) t = t.split("|").map((c) => c.trim()).filter(Boolean).join(" - ");
     const heading = /^#{1,6}\s+/.test(t);
     if (heading) t = t.replace(/^#{1,6}\s+/, "");
-    const bullet = /^([-*\u2022]|\d+[.)])\s+/.test(t);
-    if (bullet) {
+    if (/^([-*\u2022]|\d+[.)])\s+/.test(t)) {
       t = t.replace(/^([-*\u2022]|\d+[.)])\s+/, "");
-      if (!list) {
-        list = el("ul");
-        container.appendChild(list);
-      }
-      const li = el("li");
-      addInline(li, t);
-      list.appendChild(li);
+      if (!list) { list = el("ul"); container.appendChild(list); }
+      const li = el("li"); addInline(li, t); list.appendChild(li);
       return;
     }
     list = null;
-    const p = el(
-      "p",
-      heading || (t.endsWith(":") && t.length < 70) ? "sec" : "",
-    );
+    const p = el("p", heading || (t.endsWith(":") && t.length < 70) ? "sec" : "");
     addInline(p, t);
     container.appendChild(p);
   });
 }
+function linkEl(url, text) {
+  const a = el("a", "", text || new URL(url).hostname.replace(/^www\./, ""));
+  a.href = url;
+  a.target = "_blank";
+  a.rel = "noopener noreferrer";
+  return a;
+}
 
-/* ---------- settings & resume ---------- */
+/* ---------- settings, resume, LaTeX storage ---------- */
 async function loadState() {
-  const { apiKey, model, resume, resumeName } = await chrome.storage.local.get([
-    "apiKey",
-    "model",
-    "resume",
-    "resumeName",
-  ]);
-  if (apiKey) $("apiKey").value = apiKey;
-  if (model) $("model").value = model;
-  if (!apiKey) $("settings").open = true;
-  showResumeStatus(resume, resumeName);
+  const s = await chrome.storage.local.get(["apiKey", "model", "searchModel", "resume", "resumeName", "latex"]);
+  if (s.apiKey) $("apiKey").value = s.apiKey;
+  if (s.model) $("model").value = s.model;
+  if (s.searchModel && /^groq\/compound/.test(s.searchModel)) {
+    s.searchModel = DEFAULT_SEARCH_MODEL;            // retired model: switch automatically
+    await chrome.storage.local.set({ searchModel: s.searchModel });
+  }
+  if (s.searchModel) $("searchModel").value = s.searchModel;
+  if (!s.apiKey) $("settings").open = true;
+  showResumeStatus(s.resume, s.resumeName);
+  showLatexStatus(s.latex);
 }
 function showResumeStatus(resume, name) {
   $("resumeStatus").textContent = resume
     ? `Saved: ${name || "resume"} (${resume.length} characters)`
     : "No resume saved yet.";
 }
+function showLatexStatus(latex, extra = "") {
+  $("latexStatus").textContent = (latex ? `LaTeX resume saved (${latex.length} characters).` : "No LaTeX resume saved.") + extra;
+}
 $("saveSettings").addEventListener("click", async () => {
   await chrome.storage.local.set({
     apiKey: $("apiKey").value.trim(),
-    model: $("model").value.trim() || "openai/gpt-oss-120b",
+    model: $("model").value.trim() || DEFAULT_MODEL,
+    searchModel: $("searchModel").value.trim() || DEFAULT_SEARCH_MODEL,
   });
   $("settingsMsg").textContent = "Saved.";
   setTimeout(() => ($("settingsMsg").textContent = ""), 2000);
@@ -123,9 +118,7 @@ async function extractPdfText(file) {
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     const content = await page.getTextContent();
-    out +=
-      content.items.map((it) => it.str + (it.hasEOL ? "\n" : " ")).join("") +
-      "\n";
+    out += content.items.map((it) => it.str + (it.hasEOL ? "\n" : " ")).join("") + "\n";
   }
   return out;
 }
@@ -133,17 +126,9 @@ $("resumeFile").addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
   try {
-    const text = file.name.toLowerCase().endsWith(".pdf")
-      ? await extractPdfText(file)
-      : await file.text();
-    const clean = text
-      .replace(/[ \t]+/g, " ")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-    if (clean.length < 50)
-      throw new Error(
-        "Could not read text from this file. If it is a scanned PDF, paste the text instead.",
-      );
+    const text = file.name.toLowerCase().endsWith(".pdf") ? await extractPdfText(file) : await file.text();
+    const clean = text.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+    if (clean.length < 50) throw new Error("Could not read text from this file. If it is a scanned PDF, paste the text instead.");
     await chrome.storage.local.set({ resume: clean, resumeName: file.name });
     showResumeStatus(clean, file.name);
   } catch (err) {
@@ -156,119 +141,119 @@ $("saveResumeText").addEventListener("click", async () => {
   await chrome.storage.local.set({ resume: t, resumeName: "pasted text" });
   showResumeStatus(t, "pasted text");
 });
+$("saveLatex").addEventListener("click", async () => {
+  const t = $("latexText").value.trim();
+  if (!t.includes("\\begin{document}")) {
+    $("latexStatus").textContent = "This does not look like a full LaTeX resume (\\begin{document} is missing).";
+    return;
+  }
+  const upd = { latex: t };
+  const { resume } = await chrome.storage.local.get("resume");
+  let extra = "";
+  if (!resume) {
+    const txt = latexToText(t);
+    if (txt.length >= 50) {
+      upd.resume = txt;
+      upd.resumeName = "LaTeX resume (converted to text)";
+      extra = " A plain-text copy was also made for the analysis.";
+      showResumeStatus(txt, upd.resumeName);
+    }
+  }
+  await chrome.storage.local.set(upd);
+  $("latexText").value = "";
+  showLatexStatus(t, extra);
+});
+$("clearLatex").addEventListener("click", async () => {
+  await chrome.storage.local.remove("latex");
+  showLatexStatus(null);
+});
 
 /* ---------- read the current page ---------- */
 async function readActivePage() {
-  const [tab] = await chrome.tabs.query({
-    active: true,
-    lastFocusedWindow: true,
-  });
-  if (
-    !tab ||
-    !tab.id ||
-    /^(chrome|edge|about|chrome-extension):/.test(tab.url || "")
-  ) {
+  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  if (!tab || !tab.id || /^(chrome|edge|about|chrome-extension):/.test(tab.url || "")) {
     throw new Error("Open a normal job page in the active tab first.");
   }
   const [res] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
     func: () => {
       const sel = String(window.getSelection() || "").trim();
-      const jobSelectors = [
-        "main",
-        "[role='main']",
-        "article",
-        ".job-description",
-        ".job-details",
-        ".description",
-        ".posting",
-        ".jd",
-        "#jobDescription",
-      ];
-      const cleanedDom = document.body ? document.body.cloneNode(true) : null;
-      if (cleanedDom) {
-        cleanedDom
-          .querySelectorAll(
-            "nav, header, footer, aside, script, style, noscript, svg, iframe, form, button",
-          )
-          .forEach((node) => node.remove());
-      }
-      const candidateText = (
-        cleanedDom
-          ? jobSelectors.flatMap((selector) =>
-              Array.from(cleanedDom.querySelectorAll(selector)).map(
-                (el) => el.innerText || "",
-              ),
-            )
-          : []
-      ).join("\n\n");
-      const bodyText = document.body ? document.body.innerText : "";
-      const baseText = candidateText || bodyText;
-      return {
-        title: document.title,
-        url: location.href,
-        selection: sel,
-        text: baseText,
-      };
+      return { title: document.title, url: location.href, selection: sel, text: document.body ? document.body.innerText : "" };
     },
   });
   const r = res.result;
-  const useSel =
-    r.selection.length > 300 &&
-    r.selection.length >= Math.min(r.text.length, 5000) * 0.35;
-  const text = (useSel ? r.selection : r.text)
-    .replace(/[ \t]+/g, " ")
-    .replace(/[\r\n]{3,}/g, "\n\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return {
-    title: r.title,
-    url: r.url,
-    text: text.slice(0, MAX_PAGE_CHARS),
-    usedSelection: useSel,
-  };
+  const useSel = r.selection.length > 300;
+  const text = (useSel ? r.selection : r.text).replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  return { title: r.title, url: r.url, text: text.slice(0, MAX_PAGE_CHARS), usedSelection: useSel };
 }
 
 /* ---------- Groq ---------- */
-async function callGroq(messages, { json = false } = {}) {
-  const { apiKey, model } = await chrome.storage.local.get(["apiKey", "model"]);
-  if (!apiKey) throw new Error("Add your Groq API key in Settings first.");
-  const m = model || "openai/gpt-oss-120b";
-  const body = { model: m, messages, temperature: 0.3, max_tokens: 2000 };
-  if (json) body.response_format = { type: "json_object" };
-  if (m.includes("gpt-oss")) body.reasoning_effort = "low";
-
+class GroqError extends Error {
+  constructor(msg, status, retryAfter) { super(msg); this.status = status; this.retryAfter = retryAfter; }
+}
+function parseRetrySeconds(msg) {
+  const m = /try again in\s+(?:(\d+)m)?\s*([\d.]+)s/i.exec(msg || "");
+  return m ? (m[1] ? Number(m[1]) * 60 : 0) + Number(m[2]) : null;
+}
+async function groqRequest(body) {
+  const { apiKey } = await chrome.storage.local.get("apiKey");
+  if (!apiKey) throw new GroqError("Add your Groq API key in Settings first.", 0);
   const resp = await fetch(GROQ_URL, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: "Bearer " + apiKey,
-    },
+    headers: { "Content-Type": "application/json", Authorization: "Bearer " + apiKey },
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
     let detail = "";
-    try {
-      detail = (await resp.json()).error?.message || "";
-    } catch {}
-    if (resp.status === 401)
-      throw new Error("Invalid API key. Check it in Settings.");
-    if (resp.status === 429)
-      throw new Error(
-        "Groq rate limit reached. Wait a minute and try again. " + detail,
-      );
-    throw new Error(`Groq error ${resp.status}. ${detail}`);
+    try { detail = (await resp.json()).error?.message || ""; } catch {}
+    if (resp.status === 401) throw new GroqError("Invalid API key. Check it in Settings.", 401);
+    if (resp.status === 404) throw new GroqError(`Model "${body.model}" is not available. Groq may have retired or renamed it. Change the model name in Settings.`, 404);
+    if (resp.status === 413) throw new GroqError("The request was too large for Groq's free tier. Try again in a minute or use a different model in Settings.", 413);
+    if (resp.status === 429) {
+      const ra = Number(resp.headers.get("retry-after")) || parseRetrySeconds(detail);
+      throw new GroqError("Groq rate limit reached. " + detail, 429, ra);
+    }
+    throw new GroqError(`Groq error ${resp.status}. ${detail}`, resp.status);
   }
-  const data = await resp.json();
+  return resp.json();
+}
+async function callGroq(messages, { json = false, model, maxTokens = 2000 } = {}) {
+  const s = await chrome.storage.local.get("model");
+  const m = model || s.model || DEFAULT_MODEL;
+  const body = { model: m, messages, temperature: 0.3, max_tokens: maxTokens };
+  if (json) body.response_format = { type: "json_object" };
+  if (m.includes("gpt-oss")) body.reasoning_effort = "low";
+  const data = await groqRequest(body);
   return data.choices?.[0]?.message?.content || "";
 }
+// On a rate-limit error, wait and retry automatically (up to 2 times).
+async function withRetry(fn, onWait) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn(); }
+    catch (e) {
+      if (e.status !== 429 || attempt >= 2) throw e;
+      const wait = Math.min(90, Math.max(10, Math.ceil(e.retryAfter || 30)) + 2);
+      for (let s = wait; s > 0; s--) { onWait(s); await sleep(1000); }
+    }
+  }
+}
+function parseJson(text) {
+  const cleaned = String(text).replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
+  try { return JSON.parse(cleaned); }
+  catch {
+    const a = cleaned.indexOf("{"), b = cleaned.lastIndexOf("}");
+    if (a >= 0 && b > a) return JSON.parse(cleaned.slice(a, b + 1));
+    throw new Error("The model returned an unreadable answer. Try again.");
+  }
+}
 
+/* ---------- analysis ---------- */
 const ANALYSIS_SYSTEM = `You are an expert recruiter and ATS reviewer. You compare a candidate's resume with the text of a web page that contains a job posting. The page text may include navigation or unrelated listings: find the main job description and ignore the rest.
 Rules:
-- Only use facts that are explicitly present in the resume and the page text. If a fact is missing, write "Not mentioned" or use an empty array. Do not infer, assume, or fabricate company size, industry, seniority, years of experience, or project details.
+- Never invent facts. For company details, use only what the page says; otherwise write "Not mentioned".
 - Do not predict the chance of being hired. Give a fit score based only on how well the resume matches the stated requirements.
 - Resume edits must be specific, truthful and based on what the resume already contains. Never suggest adding skills or experience the candidate does not have; suggest rewording, reordering or emphasising instead.
-- Keep matched_skills and missing_skills grounded in the listed text only. Do not add buzzwords that are not in either source.
+- missing_skills and matched_skills must be short names (1 to 4 words each), for example "Docker" or "REST APIs".
 Return ONLY valid JSON in exactly this shape:
 {
  "job_title": string,
@@ -280,131 +265,11 @@ Return ONLY valid JSON in exactly this shape:
  "missing_skills": [string],
  "resume_edits": [{"section": string, "issue": string, "suggestion": string}],
  "company_info": {"summary": string, "industry": string, "size_or_stage": string, "location": string},
- "red_flags": [string]
+ "jd_summary": string (under 120 words: main responsibilities and requirements),
+ "jd_keywords": [string] (up to 20 important skills, tools and keywords from the job)
 }
 Give 3 to 6 resume_edits. Use empty arrays when there is nothing to list.`;
 
-function parseJson(text) {
-  const cleaned = text
-    .replace(/^```(?:json)?/i, "")
-    .replace(/```$/, "")
-    .trim();
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const a = cleaned.indexOf("{"),
-      b = cleaned.lastIndexOf("}");
-    if (a >= 0 && b > a) return JSON.parse(cleaned.slice(a, b + 1));
-    throw new Error("The model returned an unreadable answer. Try again.");
-  }
-}
-
-function normalizeGroundText(value) {
-  return String(value ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function groundedMatch(item, sourceText = "") {
-  const label = normalizeGroundText(item);
-  const haystack = normalizeGroundText(sourceText);
-  if (!label || !haystack) return true;
-  if (/^not mentioned$/i.test(item)) return false;
-  const terms = label.split(" ").filter((part) => part.length > 2);
-  if (!terms.length) return false;
-  const overlap = terms.filter((term) => haystack.includes(term));
-  return overlap.length >= Math.min(terms.length, 2);
-}
-
-function sanitizeList(value, sourceText = "") {
-  if (!Array.isArray(value)) return [];
-  return value
-    .map((item) =>
-      String(item ?? "")
-        .replace(/\s+/g, " ")
-        .trim(),
-    )
-    .filter(
-      (item) =>
-        item &&
-        item.length < 120 &&
-        !/^not mentioned$/i.test(item) &&
-        groundedMatch(item, sourceText),
-    )
-    .slice(0, 15);
-}
-
-function sanitizeAnalysis(
-  data,
-  { resumeText = "", pageText = "", pageTitle = "" } = {},
-) {
-  const breakdown = data?.breakdown || {};
-  const companyInfo = data?.company_info || {};
-  const sourceText = `${resumeText}\n${pageText}\n${pageTitle}`;
-  const companyName = String(data?.company || "Not mentioned").trim();
-  const titleName = String(data?.job_title || "Job").trim();
-  const safe = {
-    job_title:
-      titleName && groundedMatch(titleName, `${pageTitle}\n${pageText}`)
-        ? titleName
-        : "Job",
-    company:
-      companyName &&
-      companyName.toLowerCase() !== "not mentioned" &&
-      groundedMatch(companyName, `${pageTitle}\n${pageText}`)
-        ? companyName
-        : "Not mentioned",
-    fit_score: clamp(Number(data?.fit_score) || 0),
-    verdict:
-      String(
-        data?.verdict || "The resume is a partial match to the posting.",
-      ).trim() || "The resume is a partial match to the posting.",
-    breakdown: {
-      skills: clamp(Number(breakdown.skills) || 0),
-      experience: clamp(Number(breakdown.experience) || 0),
-      education: clamp(Number(breakdown.education) || 0),
-      keywords: clamp(Number(breakdown.keywords) || 0),
-    },
-    matched_skills: sanitizeList(data?.matched_skills, sourceText).slice(0, 15),
-    missing_skills: sanitizeList(data?.missing_skills, sourceText).slice(0, 15),
-    resume_edits: Array.isArray(data?.resume_edits)
-      ? data.resume_edits
-          .filter((item) => item && typeof item === "object")
-          .map((item) => ({
-            section: String(item.section || "Resume").trim() || "Resume",
-            issue: String(item.issue || "").trim(),
-            suggestion: String(item.suggestion || "").trim(),
-          }))
-          .filter(
-            (item) =>
-              item.suggestion &&
-              /[A-Za-z]{3,}/.test(item.suggestion) &&
-              groundedMatch(item.suggestion, sourceText),
-          )
-          .slice(0, 6)
-      : [],
-    company_info: {
-      summary:
-        String(companyInfo.summary || "Not mentioned").trim() ||
-        "Not mentioned",
-      industry:
-        String(companyInfo.industry || "Not mentioned").trim() ||
-        "Not mentioned",
-      size_or_stage:
-        String(companyInfo.size_or_stage || "Not mentioned").trim() ||
-        "Not mentioned",
-      location:
-        String(companyInfo.location || "Not mentioned").trim() ||
-        "Not mentioned",
-    },
-    red_flags: sanitizeList(data?.red_flags, pageText).slice(0, 5),
-  };
-  return safe;
-}
-
-/* ---------- render ---------- */
 function section(title) {
   const box = el("div", "box");
   box.appendChild(el("h2", "", title));
@@ -412,9 +277,7 @@ function section(title) {
 }
 function chips(list, cls) {
   const wrap = el("div", "chips");
-  (list || []).forEach((t) =>
-    wrap.appendChild(el("span", "chip " + cls, plain(t))),
-  );
+  (list || []).forEach((t) => wrap.appendChild(el("span", "chip " + cls, plain(t))));
   if (!list || !list.length) wrap.appendChild(el("span", "hint", "None"));
   return wrap;
 }
@@ -427,38 +290,22 @@ function render(a) {
   const num = el("div", "score-num", String(clamp(a.fit_score)));
   num.appendChild(el("small", "", "/100"));
   const info = el("div");
-  info.appendChild(
-    el(
-      "div",
-      "job-title",
-      plain(`${a.job_title || "Job"} at ${a.company || "company"}`),
-    ),
-  );
+  info.appendChild(el("div", "job-title", plain(`${a.job_title || "Job"} at ${a.company || "company"}`)));
   info.appendChild(el("p", "verdict", plain(a.verdict)));
   row.append(num, info);
   top.appendChild(row);
   const bd = a.breakdown || {};
-  [
-    ["Skills", bd.skills],
-    ["Experience", bd.experience],
-    ["Education", bd.education],
-    ["Keywords", bd.keywords],
-  ].forEach(([label, v]) => {
-    const r = el("div", "bar-row");
-    const bar = el("div", "bar");
-    const fill = el("span");
-    fill.style.width = clamp(v) + "%";
-    bar.appendChild(fill);
-    r.append(el("span", "", label), bar, el("span", "", clamp(v) + "%"));
-    top.appendChild(r);
-  });
-  top.appendChild(
-    el(
-      "p",
-      "note",
-      "Fit score shows how closely your resume matches the posting. It is not a prediction of being hired.",
-    ),
-  );
+  [["Skills", bd.skills], ["Experience", bd.experience], ["Education", bd.education], ["Keywords", bd.keywords]]
+    .forEach(([label, v]) => {
+      const r = el("div", "bar-row");
+      const bar = el("div", "bar");
+      const fill = el("span");
+      fill.style.width = clamp(v) + "%";
+      bar.appendChild(fill);
+      r.append(el("span", "", label), bar, el("span", "", clamp(v) + "%"));
+      top.appendChild(r);
+    });
+  top.appendChild(el("p", "note", "Fit score shows how closely your resume matches the posting. It is not a prediction of being hired."));
   root.appendChild(top);
 
   const skills = section("Skills");
@@ -468,80 +315,405 @@ function render(a) {
   skills.appendChild(chips(a.missing_skills, "gap"));
   root.appendChild(skills);
 
-  const edits = section("Suggested resume changes");
+  const editsBox = section("Suggested resume changes");
   (a.resume_edits || []).forEach((e) => {
     const d = el("div", "edit");
     d.appendChild(el("div", "where", plain(e.section) || "Resume"));
     if (e.issue) d.appendChild(el("div", "why", plain(e.issue)));
     d.appendChild(el("div", "", plain(e.suggestion)));
-    edits.appendChild(d);
+    editsBox.appendChild(d);
   });
-  root.appendChild(edits);
-
-  const c = a.company_info || {};
-  const comp = section("Company");
-  if (c.summary) comp.appendChild(el("p", "", plain(c.summary)));
-  const ul = el("ul");
-  [
-    ["Industry", c.industry],
-    ["Size or stage", c.size_or_stage],
-    ["Location", c.location],
-  ].forEach(([k, v]) =>
-    ul.appendChild(el("li", "", `${k}: ${plain(v) || "Not mentioned"}`)),
-  );
-  comp.appendChild(ul);
-  root.appendChild(comp);
-
-  if (a.red_flags && a.red_flags.length) {
-    const rf = section("Things to check");
-    const l = el("ul");
-    a.red_flags.forEach((t) => l.appendChild(el("li", "", plain(t))));
-    rf.appendChild(l);
-    root.appendChild(rf);
-  }
+  root.appendChild(editsBox);
   root.hidden = false;
+}
+
+/* ---------- company check (web search, automatic) ---------- */
+function riskBar(level) {
+  const rank = RISK_RANK[level];
+  const names = { unknown: "Not enough information", low: "Low risk", medium: "Medium risk", high: "High risk" };
+  const wrap = el("div", "risk " + level);
+  const bar = el("div", "risk-bar");
+  for (let i = 1; i <= 3; i++) bar.appendChild(el("span", "seg" + (i <= rank ? " on" : "")));
+  wrap.append(bar, el("div", "risk-label", names[level]));
+  return wrap;
+}
+function renderCompany(data, local, note, analysis) {
+  const box = $("companyBox");
+  box.hidden = false;
+  box.replaceChildren(el("h2", "", "Company check"));
+  if (note) box.appendChild(el("div", "hint", note));
+
+  const level = finalRisk(data ? data.level : "unknown", local.score);
+  if (data || local.flags.length) box.appendChild(riskBar(level));
+  if (data && data.reason) box.appendChild(el("p", "", data.reason));
+
+  if (data) {
+    if (data.summary) box.appendChild(el("p", "", data.summary));
+    const ul = el("ul");
+    if (data.industry) ul.appendChild(el("li", "", "Industry: " + data.industry));
+    if (data.size) ul.appendChild(el("li", "", "Size or stage: " + data.size));
+    if (data.website) { const li = el("li", "", "Website: "); li.appendChild(linkEl(data.website)); ul.appendChild(li); }
+    if (ul.children.length) box.appendChild(ul);
+  } else if (analysis && analysis.company_info) {
+    const c = analysis.company_info;
+    box.appendChild(el("p", "hint", "From the job page only:"));
+    const ul = el("ul");
+    [["About", c.summary], ["Industry", c.industry], ["Size or stage", c.size_or_stage], ["Location", c.location]]
+      .forEach(([k, v]) => ul.appendChild(el("li", "", `${k}: ${plain(v) || "Not mentioned"}`)));
+    box.appendChild(ul);
+  }
+
+  const flags = [
+    ...local.flags.map((f) => ({ ...f, link: "", where: "Found in this job posting" })),
+    ...(data ? data.flags : []).map((f) => ({ ...f, where: "Found online" })),
+  ];
+  if (flags.length) {
+    box.appendChild(el("h3", "", "Red flags"));
+    flags.forEach((f) => {
+      const d = el("div", "flag");
+      d.appendChild(el("strong", "", f.flag));
+      if (f.evidence) d.appendChild(el("div", "ev", "\u201C" + f.evidence + "\u201D"));
+      const w = el("div", "where", f.where + " ");
+      if (f.link) { w.appendChild(linkEl(f.link)); if (f.linkNote) w.appendChild(document.createTextNode(` (${f.linkNote})`)); }
+      d.appendChild(w);
+      box.appendChild(d);
+    });
+  }
+
+  if (data && data.findings.length) {
+    const det = el("details");
+    det.open = level === "medium" || level === "high";
+    det.appendChild(el("summary", "", `Sources and findings (${data.findings.length})`));
+    data.findings.forEach((f) => {
+      const d = el("div", "finding " + f.type, f.text + " ");
+      if (f.link) {
+        d.appendChild(linkEl(f.link));
+        if (f.linkNote) d.appendChild(el("span", "hint", ` (${f.linkNote})`));
+      } else d.appendChild(el("span", "hint", "(no working link)"));
+      det.appendChild(d);
+    });
+    box.appendChild(det);
+  }
+  if (data && !data.verified) {
+    box.appendChild(el("p", "warn", "No source could be fully confirmed automatically. Open the links yourself before trusting this result."));
+  }
+  if (data || local.flags.length) {
+    box.appendChild(el("p", "note", "This is evidence from a web search, not a verdict. Always verify a company yourself before sharing documents or paying any money."));
+  }
+}
+
+const COMPANY_SYSTEM = `You are a careful job-scam researcher. Use your browser search tool to learn about the company in a job posting: its official website, LinkedIn page, news, and reviews or complaints (for example "COMPANY scam" and "COMPANY reviews").
+Rules:
+- Report only what you actually found while searching. If you find little, say so. Never call a company safe just because you found no complaints.
+- Do not state as fact that a company is a scam. Describe the evidence and give a risk level.
+- Every finding and red flag needs the full https URL of the page where you saw it. Never guess or invent a URL; leave source empty if you do not have one.
+Return ONLY a JSON object (no markdown) in exactly this shape:
+{"summary": string (2-3 sentences on what the company does, from sources), "industry": string, "size_or_stage": string, "website": string (official site URL or ""),
+ "risk_level": "low" | "medium" | "high" | "unknown",
+ "risk_reason": string (one or two sentences),
+ "findings": [{"text": string, "type": "positive" | "negative" | "neutral", "source": string}],
+ "red_flags": [{"flag": string, "evidence": string, "source": string}]}
+Use "unknown" if you could not find enough reliable information. At most 6 findings.`;
+
+// Groq's browser search does not return citations reliably, so every link the model gives is
+// opened by the extension itself: dead links (404, no such site) are dropped.
+async function checkLink(url, name, trusted) {
+  if (trusted) return { ok: true, note: "" };
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 7000);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, credentials: "omit", redirect: "follow" });
+    if (r.status === 404 || r.status === 410) return { ok: false };
+    if (!r.ok) return { ok: true, note: "could not be checked automatically" };
+    const text = (await r.text()).slice(0, 400000).toLowerCase();
+    const lower = name.toLowerCase();
+    const token = lower.split(/\s+/).find((w) => w.length >= 3) || lower;
+    return { ok: true, note: text.includes(lower) || text.includes(token) ? "" : "page does not mention the company name" };
+  } catch (e) {
+    return e.name === "AbortError" ? { ok: true, note: "could not be checked automatically" } : { ok: false };
+  } finally { clearTimeout(timer); }
+}
+async function verifyLinks(items, name, allowed) {
+  const href = (u) => { try { const h = new URL(u).href; return normUrl(h) ? h : ""; } catch { return ""; } };
+  const urls = [...new Set(items.map((i) => href(i.link)).filter(Boolean))];
+  const res = {};
+  await Promise.all(urls.map(async (u) => { res[u] = await checkLink(u, name, allowed.has(normUrl(u))); }));
+  items.forEach((i) => {
+    const h = href(i.link), r = res[h];
+    if (r && r.ok) { i.link = h; i.linkNote = r.note; } else { i.link = ""; i.linkNote = ""; }
+  });
+}
+async function getCachedCompany(name) {
+  const { companyCache = {} } = await chrome.storage.local.get("companyCache");
+  const e = companyCache[name.toLowerCase()];
+  return e && Date.now() - e.ts < CACHE_DAYS * 864e5 ? e.data : null;
+}
+async function setCachedCompany(name, data) {
+  const { companyCache = {} } = await chrome.storage.local.get("companyCache");
+  companyCache[name.toLowerCase()] = { ts: Date.now(), data };
+  const keys = Object.keys(companyCache);
+  if (keys.length > 50) keys.sort((a, b) => companyCache[a].ts - companyCache[b].ts).slice(0, keys.length - 50).forEach((k) => delete companyCache[k]);
+  await chrome.storage.local.set({ companyCache });
+}
+async function fetchCompanyInfo(name, analysis, page, onWait) {
+  const { searchModel } = await chrome.storage.local.get("searchModel");
+  const model = searchModel || DEFAULT_SEARCH_MODEL;
+  const body = {
+    model, temperature: 0.2, max_tokens: 2500,
+    messages: [
+      { role: "system", content: COMPANY_SYSTEM },
+      { role: "user", content: `Company: ${name}\nJob title: ${analysis.job_title || ""}\nJob page URL: ${page.url}\nLocation hint: ${analysis.company_info?.location || ""}\nPosting excerpt:\n${page.text.slice(0, 2000)}` },
+    ],
+  };
+  if (model.includes("gpt-oss")) {          // built-in web search for GPT-OSS models
+    body.tools = [{ type: "browser_search" }];
+    body.reasoning_effort = "low";
+  }
+  const data = await withRetry(() => groqRequest(body), onWait);
+  const msg = data.choices?.[0]?.message || {};
+  // URLs that the search tool itself returned (if Groq includes them) are trusted without a fetch.
+  const allowed = new Set();
+  (JSON.stringify(msg.executed_tools || []).match(/https?:\/\/[^\s"'<>\\)\]]+/g) || [])
+    .forEach((u) => { const k = normUrl(u); if (k) allowed.add(k); });
+  const p = parseJson(msg.content || "");
+
+  const findings = (p.findings || []).slice(0, 6).map((f) => ({
+    text: plain(f.text),
+    type: ["positive", "negative", "neutral"].includes(f.type) ? f.type : "neutral",
+    link: String(f.source || ""),
+  })).filter((f) => f.text);
+  const flags = (p.red_flags || []).slice(0, 6).map((f) => ({
+    flag: plain(f.flag), evidence: plain(f.evidence), link: String(f.source || ""),
+  })).filter((f) => f.flag);
+  const site = { link: String(p.website || "") };
+  await verifyLinks([...findings, ...flags, site], name, allowed);
+
+  const verified = [...findings, ...flags, site].some((i) => i.link && !i.linkNote);
+  let level = ["low", "medium", "high", "unknown"].includes(p.risk_level) ? p.risk_level : "unknown";
+  if (!findings.length && !flags.length) level = "unknown";
+  if (level === "low" && !verified) level = "unknown";   // never reassure without a checked source
+  return {
+    name, level, verified, reason: plain(p.risk_reason),
+    summary: plain(p.summary), industry: plain(p.industry), size: plain(p.size_or_stage),
+    website: site.link, findings, flags,
+  };
+}
+async function checkCompany(analysis, page, id) {
+  const local = localRedFlags(page.text);
+  const name = (analysis.company || "").trim();
+  if (!name || /^(not mentioned|company|unknown|n\/a)$/i.test(name)) {
+    renderCompany(null, local, "The company name was not found on this page, so the web check was skipped.", analysis);
+    return;
+  }
+  renderCompany(null, local, `Searching the web for ${name}...`, analysis);
+  try {
+    let data = await getCachedCompany(name);
+    if (!data) {
+      data = await fetchCompanyInfo(name, analysis, page, (s) => {
+        if (id === runId) renderCompany(null, local, `Rate limit reached. Retrying the company check in ${s}s...`, analysis);
+      });
+      if (data.level !== "unknown") await setCachedCompany(name, data);
+    }
+    if (id === runId) renderCompany(data, local, "", analysis);
+  } catch (e) {
+    if (id === runId) renderCompany(null, local, "Company web check unavailable: " + e.message, analysis);
+  }
+}
+
+/* ---------- skills checklist + LaTeX tailoring ---------- */
+function renderTailorBox(analysis) {
+  const box = $("tailorBox");
+  box.replaceChildren();
+  box.hidden = false;
+  box.appendChild(el("h2", "", "Tailor my LaTeX resume"));
+  box.appendChild(el("p", "hint", "Tick only the skills you really have. They will be added to your Skills section. Nothing is invented, and the resume is only changed when you click the button."));
+
+  const list = el("div");
+  list.id = "skillList";
+  const missing = (analysis.missing_skills || []).slice(0, 15);
+  missing.forEach((s) => {
+    const row = el("div", "skill-row");
+    const lab = el("label", "chk");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.dataset.skill = plain(s);
+    lab.append(cb, document.createTextNode(" " + plain(s)));
+    const note = document.createElement("input");
+    note.type = "text";
+    note.className = "skill-note";
+    note.placeholder = "Where did you use it? (optional)";
+    row.append(lab, note);
+    list.appendChild(row);
+  });
+  if (!missing.length) list.appendChild(el("p", "hint", "No missing skills were found."));
+  box.appendChild(list);
+
+  const lab = el("label", "", "Other skills from the job that you have (comma separated)");
+  lab.htmlFor = "extraSkills";
+  const extra = document.createElement("input");
+  extra.type = "text"; extra.id = "extraSkills";
+  const btn = el("button", "primary", "Suggest resume edits");
+  btn.id = "tailorBtn";
+  btn.style.marginTop = "10px";
+  const st = el("div", "status"); st.id = "tailorStatus";
+  const out = el("div"); out.id = "tailorOut";
+  box.append(lab, extra, btn, st, out);
+  btn.addEventListener("click", runTailor);
+}
+function collectSkills() {
+  const found = [];
+  document.querySelectorAll("#skillList .skill-row").forEach((row) => {
+    const cb = row.querySelector("input[type=checkbox]");
+    if (cb && cb.checked) found.push({ skill: cb.dataset.skill, note: row.querySelector(".skill-note").value.trim() });
+  });
+  ($("extraSkills").value || "").split(",").map((s) => s.trim()).filter(Boolean)
+    .forEach((s) => found.push({ skill: s, note: "" }));
+  return found;
+}
+const TAILOR_SYSTEM = `You tailor a LaTeX resume to one job. You do NOT rewrite the whole file. You return a list of small edits that a program applies by exact find-and-replace.
+RULES:
+- FIND must be copied exactly, character for character, from the LaTeX code (one line or a few consecutive lines, for example one bullet or the skills line). It must appear only once.
+- REPLACE must keep all LaTeX commands, braces and structure. Change only the wording, order or emphasis of the text.
+- Use only facts that are in the resume plus the CONFIRMED SKILLS list. Never invent tools, projects, employers, dates or numbers. A confirmed skill may be added to the Skills section. Mention it inside a bullet only if the user gave a "used in" note, and then only as that note describes.
+- Special LaTeX characters in new text must be escaped (\\& \\% \\# \\_).
+- Use the job keywords naturally so an ATS can find them. Keep each line about the same length so the resume stays on one page.
+- At most 10 edits, most important first. If nothing should change, return no edits.
+OUTPUT FORMAT (plain text only: no markdown fences, no JSON):
+===EDIT===
+SECTION: <section name>
+REASON: <one short sentence>
+---FIND---
+<exact text from the resume>
+---REPLACE---
+<new text>
+===END===
+Repeat the block for each edit.`;
+
+async function runTailor() {
+  const btn = $("tailorBtn"), out = $("tailorOut");
+  out.replaceChildren();
+  const { latex } = await chrome.storage.local.get("latex");
+  if (!latex) { setStatus("Save your LaTeX resume first (in the Your resume section).", true, "tailorStatus"); return; }
+  if (!current) return;
+  const confirmed = collectSkills();
+  const { analysis } = current;
+  const prep = prepLatexBody(latex, MAX_LATEX_CHARS);
+  latexTruncated = prep.truncated;
+  const skillsText = confirmed.length
+    ? confirmed.map((c) => `- ${c.skill}${c.note ? ` (used in: ${c.note})` : ""}`).join("\n")
+    : "(none)";
+  btn.disabled = true;
+  try {
+    setStatus("Asking the model for edits...", false, "tailorStatus");
+    const content = await withRetry(
+      () => callGroq([
+        { role: "system", content: TAILOR_SYSTEM },
+        { role: "user", content: `JOB TITLE: ${analysis.job_title}\nCOMPANY: ${analysis.company}\nJOB SUMMARY: ${analysis.jd_summary || ""}\nJOB KEYWORDS: ${(analysis.jd_keywords || []).join(", ")}\n\nCONFIRMED SKILLS (the candidate really has these):\n${skillsText}\n\nLATEX RESUME (body only):\n${prep.text}` },
+      ], { maxTokens: 3000 }),
+      (s) => setStatus(`Groq free-tier limit reached. Retrying in ${s}s...`, false, "tailorStatus")
+    );
+    edits = parseEdits(content).map((e) => locate(latex, e));
+    renderEdits(latex, out);
+    setStatus(edits.length ? "Review the edits below, untick any you do not want." : "The model suggested no edits for this job.", false, "tailorStatus");
+  } catch (e) {
+    setStatus(e.message, true, "tailorStatus");
+  } finally {
+    btn.disabled = false;
+  }
+}
+function renderEdits(latex, out) {
+  out.replaceChildren();
+  if (latexTruncated) out.appendChild(el("p", "warn", "Your LaTeX is long, so only the first part was sent to the model. Later parts could not be edited."));
+  if (!edits.length) return;
+  edits.forEach((e) => {
+    const card = el("div", "edit-card");
+    const head = el("label", "chk");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = e.status === "ok";
+    cb.disabled = e.status !== "ok";
+    e.cb = cb;
+    head.append(cb, el("strong", "", " " + plain(e.section)));
+    card.appendChild(head);
+    if (e.reason) card.appendChild(el("div", "why", plain(e.reason)));
+    if (e.status === "notfound") card.appendChild(el("div", "warn", "This text was not found in your LaTeX, so it will be skipped."));
+    if (e.status === "ambiguous") card.appendChild(el("div", "warn", "This text appears more than once, so it will be skipped."));
+    card.appendChild(el("div", "hint", "Before"));
+    card.appendChild(el("pre", "before", e.find));
+    card.appendChild(el("div", "hint", "After"));
+    card.appendChild(el("pre", "after", fixEscapes(e.find, e.replace)));
+    out.appendChild(card);
+  });
+  const buildBtn = el("button", "primary", "Build tailored LaTeX");
+  const res = el("div");
+  buildBtn.addEventListener("click", () => buildResult(latex, res));
+  out.append(buildBtn, res);
+}
+function buildResult(latex, res) {
+  res.replaceChildren();
+  const chosen = edits.filter((e) => e.status === "ok" && e.cb && e.cb.checked);
+  if (!chosen.length) { res.appendChild(el("p", "warn", "No edits are selected.")); return; }
+  const r = applyEdits(latex, chosen);
+  res.appendChild(el("p", "hint", `${r.applied} edit(s) applied${r.skipped ? `, ${r.skipped} skipped because they overlapped` : ""}.`));
+  checkLatex(latex, r.text).forEach((w) => res.appendChild(el("p", "warn", w)));
+  const ta = document.createElement("textarea");
+  ta.className = "code"; ta.rows = 12; ta.readOnly = true; ta.value = r.text;
+  const row = el("div", "btn-row");
+  const copy = el("button", "secondary", "Copy");
+  const dl = el("button", "secondary", "Download .tex");
+  copy.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(r.text); }
+    catch { ta.select(); document.execCommand("copy"); }
+    copy.textContent = "Copied";
+    setTimeout(() => (copy.textContent = "Copy"), 1500);
+  });
+  dl.addEventListener("click", () => {
+    const slug = (current?.analysis?.company || "job").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "job";
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([r.text], { type: "text/plain" }));
+    a.download = `resume_${slug}.tex`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+  row.append(copy, dl);
+  res.append(ta, row, el("p", "note", "Paste this into Overleaf, compile it, and check that the PDF still looks right and fits one page before you apply."));
 }
 
 /* ---------- analyze ---------- */
 $("analyze").addEventListener("click", async () => {
   const btn = $("analyze");
   btn.disabled = true;
-  $("results").hidden = true;
-  $("chatBox").hidden = true;
+  const id = ++runId;
+  ["results", "chatBox", "companyBox", "tailorBox"].forEach((x) => ($(x).hidden = true));
+  current = null; edits = [];
   try {
     const { resume } = await chrome.storage.local.get("resume");
     if (!resume) throw new Error("Upload or paste your resume first.");
     setStatus("Reading the page...");
     const page = await readActivePage();
-    if (page.text.length < 200)
-      throw new Error(
-        "This page has too little text. Open a job posting and try again.",
-      );
+    if (page.text.length < 200) throw new Error("This page has too little text. Open a job posting and try again.");
 
     setStatus("Analyzing with Groq...");
-    const content = await callGroq(
-      [
+    const content = await withRetry(
+      () => callGroq([
         { role: "system", content: ANALYSIS_SYSTEM },
-        {
-          role: "user",
-          content: `RESUME:\n${resume.slice(0, MAX_RESUME_CHARS)}\n\nPAGE URL: ${page.url}\nPAGE TITLE: ${page.title}\nPAGE TEXT:\n${page.text}`,
-        },
-      ],
-      { json: true },
+        { role: "user", content: `RESUME:\n${resume.slice(0, MAX_RESUME_CHARS)}\n\nPAGE URL: ${page.url}\nPAGE TITLE: ${page.title}\nPAGE TEXT:\n${page.text}` },
+      ], { json: true, maxTokens: 2500 }),
+      (s) => setStatus(`Groq free-tier limit reached. Retrying in ${s}s...`)
     );
-
-    const analysis = sanitizeAnalysis(parseJson(content), {
-      resumeText: resume,
-      pageText: page.text,
-      pageTitle: page.title,
-    });
+    const analysis = parseJson(content);
+    if (id !== runId) return;
+    current = { analysis, page };
     render(analysis);
+    renderTailorBox(analysis);
     setStatus(page.usedSelection ? "Done. Used your selected text." : "Done.");
 
     chatContext = `RESUME:\n${resume.slice(0, MAX_RESUME_CHARS)}\n\nJOB PAGE TEXT:\n${page.text.slice(0, MAX_CHAT_JD_CHARS)}\n\nEARLIER ANALYSIS:\n${JSON.stringify(analysis).slice(0, 2500)}`;
     chatHistory = [];
     $("chatLog").replaceChildren();
     $("chatBox").hidden = false;
+
+    checkCompany(analysis, page, id);   // runs in the background, fills the Company check box
   } catch (err) {
     setStatus(err.message, true);
   } finally {
@@ -576,8 +748,6 @@ async function sendChat() {
   }
 }
 $("chatSend").addEventListener("click", sendChat);
-$("chatInput").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") sendChat();
-});
+$("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
 
 loadState();
